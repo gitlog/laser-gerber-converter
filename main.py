@@ -215,7 +215,6 @@ class LaserConverterApp(QtWidgets.QWidget):
         self.plot_group = QtWidgets.QGroupBox("Экран интерактивной визуализации векторов")
         self.plot_layout = QtWidgets.QVBoxLayout()
         self.plot_group.setLayout(self.plot_layout)
-        
         self.view = LaserGraphicsView()
         self.plot_layout.addWidget(self.view)
         self.layout_horizontal.addWidget(self.plot_group)
@@ -223,7 +222,20 @@ class LaserConverterApp(QtWidgets.QWidget):
         self.current_gerber_geometry = None
         self.generated_gcode = None
 
+
     def load_saved_settings(self):
+        """Безопасная загрузка настроек с блокировкой автосохранения"""
+        self.combo_laser_mode.blockSignals(True)
+        self.spin_power.blockSignals(True)
+        self.spin_feed.blockSignals(True)
+        self.spin_step.blockSignals(True)
+        self.spin_overscan.blockSignals(True)
+        self.spin_rotate.blockSignals(True)
+        self.cb_snake.blockSignals(True)
+        self.cb_invert.blockSignals(True)
+        self.cb_flip_x.blockSignals(True)
+        self.cb_flip_y.blockSignals(True)
+
         try:
             self.combo_laser_mode.setCurrentIndex(int(self.settings.value("laser_mode_idx", 0)))
             self.spin_power.setValue(int(self.settings.value("laser_power", 255)))
@@ -237,6 +249,17 @@ class LaserConverterApp(QtWidgets.QWidget):
             self.cb_flip_y.setChecked(self.settings.value("cb_flip_y", "false") == "true")
         except Exception as e:
             print(f"Инициализация INI: {str(e)}")
+        finally:
+            self.combo_laser_mode.blockSignals(False)
+            self.spin_power.blockSignals(False)
+            self.spin_feed.blockSignals(False)
+            self.spin_step.blockSignals(False)
+            self.spin_overscan.blockSignals(False)
+            self.spin_rotate.blockSignals(False)
+            self.cb_snake.blockSignals(False)
+            self.cb_invert.blockSignals(False)
+            self.cb_flip_x.blockSignals(False)
+            self.cb_flip_y.blockSignals(False)
 
     def save_current_settings(self):
         self.settings.setValue("laser_mode_idx", self.combo_laser_mode.currentIndex())
@@ -254,6 +277,7 @@ class LaserConverterApp(QtWidgets.QWidget):
     def closeEvent(self, event):
         self.save_current_settings()
         event.accept()
+
     def browse_file(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Открыть Gerber файл", "", "Gerber Files (*.gbr *.pho);;All Files (*)")
         if file_path:
@@ -305,6 +329,7 @@ class LaserConverterApp(QtWidgets.QWidget):
     def update_interactive_preview(self):
         """Скоростная отрисовка Qt Painter с учетом двустороннего overscan"""
         if self.current_gerber_geometry is None: return
+
         self.save_current_settings()
         overscan = self.spin_overscan.value()
         invert_mode = self.cb_invert.isChecked()
@@ -320,7 +345,6 @@ class LaserConverterApp(QtWidgets.QWidget):
             self.view.scene.clear()
             qt_path = QtGui.QPainterPath()
 
-            # ИСПРАВЛЕНО: Безопасное извлечение отдельных точек из массивов Shapely
             def add_shapely_to_qt_path(g_item):
                 if g_item.is_empty: return
                 if g_item.geom_type == 'Polygon':
