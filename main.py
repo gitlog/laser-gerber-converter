@@ -486,7 +486,7 @@ class LaserConverterApp(QtWidgets.QWidget):
 
             gcode = []
             gcode.append("; Gerber -> LaserGRBL GCode (Native Fast Engine)")
-            gcode.append(f"G21 ; Миллиметры\nG90 ; Абсолютные координаты\n{selected_mode_txt} S0 ; Инициализация лазера")
+            gcode.append(f"G21 ; Миллиметры\nG90 ; Абсолютные координаты\n{selected_mode_txt} S0 ; Инициализация лазера\nG1 F{feedrate}")
             gcode.append(f"G0 X{0.0000:.4f} Y{(ymin + (step / 2.0)):.4f} F{feedrate} ; Старт")
 
             # Замечание 2: Безопасный расчет количества строк растра
