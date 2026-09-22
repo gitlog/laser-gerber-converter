@@ -62,6 +62,8 @@ python main.py
 
 <details>
   <summary>📷 Посмотреть скриншот</summary>
-  ![gbr](gbr.png)
-  ![gcode](gcode.png)
+
+  ![gbr](gbr.png "gbr")
+  ![gcode](gcode.png "gbr")
+
 </details>
