@@ -16,8 +16,16 @@ from PyQt6 import QtWidgets, QtCore, QtGui
 class LaserGraphicsView(QtWidgets.QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        self.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform)
+        
+        # БЕЗ OPENGL: Используем только стандартный движок, но с агрессивным кэшированием
+        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False) # Выключаем сглаживание для скорости
+        self.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+        
+        # Обновляем только те пиксели, которые реально изменились (экономит CPU)
+        self.setViewportUpdateMode(QtWidgets.QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
+        
+        # ИСПРАВЛЕНО ДЛЯ PyQt6: Включаем кэширование заднего фона (координатной сетки)
+        self.setCacheMode(QtWidgets.QGraphicsView.CacheModeFlag.CacheBackground)
         
         self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -38,7 +46,7 @@ class LaserGraphicsView(QtWidgets.QGraphicsView):
             self.scale(1.0 / zoom_factor, 1.0 / zoom_factor)
 
     def drawBackground(self, painter: QtGui.QPainter, rect: QtCore.QRectF):
-        """Динамическая миллиметровая сетка и координатные оси станка ЧПУ"""
+        """Динамическая миллиметровая сетка (Оптимизированная под CPU)"""
         painter.fillRect(rect, QtGui.QColor("#e8e8e8"))
         
         scene_rect = self.sceneRect()
@@ -47,15 +55,19 @@ class LaserGraphicsView(QtWidgets.QGraphicsView):
         top = int(math.floor(scene_rect.top()))
         bottom = int(math.ceil(scene_rect.bottom()))
         
-        pen_grid_1mm = QtGui.QPen(QtGui.QColor("#dcdcdc"), 0.05, QtCore.Qt.PenStyle.SolidLine)
-        pen_grid_10mm = QtGui.QPen(QtGui.QColor("#b8b8b8"), 0.15, QtCore.Qt.PenStyle.SolidLine)
-        pen_axes = QtGui.QPen(QtGui.QColor("#808080"), 0.4, QtCore.Qt.PenStyle.SolidLine)
+        # Толщина 0 включает режим косметического пера (Fast Line Drawing)
+        pen_grid_1mm = QtGui.QPen(QtGui.QColor("#dcdcdc"), 0, QtCore.Qt.PenStyle.SolidLine)
+        pen_grid_10mm = QtGui.QPen(QtGui.QColor("#b8b8b8"), 0, QtCore.Qt.PenStyle.SolidLine)
+        pen_axes = QtGui.QPen(QtGui.QColor("#808080"), 0, QtCore.Qt.PenStyle.SolidLine)
+        
+        # Показываем 1мм сетку только при близком зуме
+        show_1mm = (right - left) < 150
         
         for x in range(left - 10, right + 10):
             if x % 10 == 0:
                 painter.setPen(pen_grid_10mm)
                 painter.drawLine(x, top - 10, x, bottom + 10)
-            elif x % 1 == 0 and (right - left) < 300:
+            elif show_1mm and x % 1 == 0:
                 painter.setPen(pen_grid_1mm)
                 painter.drawLine(x, top - 10, x, bottom + 10)
                 
@@ -63,7 +75,7 @@ class LaserGraphicsView(QtWidgets.QGraphicsView):
             if y % 10 == 0:
                 painter.setPen(pen_grid_10mm)
                 painter.drawLine(left - 10, y, right + 10, y)
-            elif y % 1 == 0 and (bottom - top) < 300:
+            elif show_1mm and y % 1 == 0:
                 painter.setPen(pen_grid_1mm)
                 painter.drawLine(left - 10, y, right + 10, y)
 
@@ -91,11 +103,11 @@ class LaserConverterApp(QtWidgets.QWidget):
         super().__init__()
         ini_path = os.path.expanduser("~/.LaserConverterApp.ini")
         self.settings = QtCore.QSettings(ini_path, QtCore.QSettings.Format.IniFormat)
-
+        
         self.current_gerber_geometry = None
         self.generated_gcode = None
         self.gerber_is_inches = False
-
+        
         self.init_ui()
         self.load_saved_settings()
 
@@ -159,7 +171,7 @@ class LaserConverterApp(QtWidgets.QWidget):
         self.spin_overscan.setRange(0.0, 50.0)
         self.spin_overscan.setValue(2.0)
         self.param_grid.addWidget(self.spin_overscan, 4, 1)
-
+        
         self.param_grid.addWidget(QtWidgets.QLabel("Точный поворот стола (град):"), 5, 0)
         self.spin_rotate = QtWidgets.QDoubleSpinBox()
         self.spin_rotate.setDecimals(3)
@@ -187,7 +199,7 @@ class LaserConverterApp(QtWidgets.QWidget):
         self.spin_power.valueChanged.connect(self.save_current_settings)
         self.spin_feed.valueChanged.connect(self.save_current_settings)
         self.spin_step.valueChanged.connect(self.save_current_settings)
-
+        
         self.spin_rotate.valueChanged.connect(self.update_interactive_preview)
         self.spin_overscan.valueChanged.connect(self.update_interactive_preview)
         self.cb_invert.stateChanged.connect(self.update_interactive_preview)
@@ -283,25 +295,28 @@ class LaserConverterApp(QtWidgets.QWidget):
 
     def load_gerber_geometry(self, gerber_path):
         try:
+            # Замечание 4: Явно указываем UTF-8 кодировку
             with open(gerber_path, 'r', encoding='utf-8', errors='ignore') as f:
                 gerber_source = f.read()
-
+            
+            # Замечание 1: Проверяем дюймы (%MOIN%)
             self.gerber_is_inches = "%MOIN%" in gerber_source
 
             processor = GerberProcessor()
             parser = GerberParser(processor)
             tokens = tokenize_gerber(gerber_source)
             parser.parse(tokens)
-
+            
             parsed_geoms = [g for g in processor.geometries if not g.is_empty]
-
+            
+            # Замечание 1: Масштабируем дюймы в мм
             if self.gerber_is_inches:
                 self.current_gerber_geometry = [scale(g, xfact=25.4, yfact=25.4, origin=(0, 0)) for g in parsed_geoms]
             else:
                 self.current_gerber_geometry = parsed_geoms
 
             if not self.current_gerber_geometry:
-                raise ValueError("Файл успешно прочитан, но не содержит графических векторов.")
+                raise ValueError("Файл не содержит графических векторов.")
 
             self.update_interactive_preview()
             self.view.fitInView(self.view.scene.itemsBoundingRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
@@ -311,7 +326,8 @@ class LaserConverterApp(QtWidgets.QWidget):
             self.status_label.setStyleSheet("color: red;")
 
     def get_transformed_elements(self):
-        if not self.current_gerber_geometry:
+        # Замечание 6: Защита от пустой геометрии
+        if not self.current_gerber_geometry: 
             return []
 
         rotate_angle = self.spin_rotate.value()
@@ -347,7 +363,7 @@ class LaserConverterApp(QtWidgets.QWidget):
         try:
             transformed_elements = self.get_transformed_elements()
             if not transformed_elements: return
-
+            
             t_bounds = [g.bounds for g in transformed_elements]
             t_xmin = min([b[0] for b in t_bounds])
             t_ymin = min([b[1] for b in t_bounds])
@@ -396,18 +412,20 @@ class LaserConverterApp(QtWidgets.QWidget):
 
             self.view.scene.setSceneRect(-5, -h - 5, w + 10, h + 10)
 
+            path_item = QtWidgets.QGraphicsPathItem(qt_path)
+            # Включаем DeviceCoordinateCache процессора для плавной отрисовки зума без лагов
+            path_item.setCacheMode(QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache)
+
             if invert_mode:
                 bg_rect = QtWidgets.QGraphicsRectItem(0, -h, w, h)
                 bg_rect.setBrush(QtGui.QBrush(QtGui.QColor("#1565c0")))
                 bg_rect.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen))
                 self.view.scene.addItem(bg_rect)
 
-                path_item = QtWidgets.QGraphicsPathItem(qt_path)
                 path_item.setBrush(QtGui.QBrush(QtGui.QColor("#e8e8e8")))
                 path_item.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen))
                 self.view.scene.addItem(path_item)
             else:
-                path_item = QtWidgets.QGraphicsPathItem(qt_path)
                 path_item.setBrush(QtGui.QBrush(QtGui.QColor("#2e7d32")))
                 path_item.setPen(QtGui.QPen(QtGui.QColor("#2e7d32"), 0.1))
                 self.view.scene.addItem(path_item)
@@ -453,6 +471,7 @@ class LaserConverterApp(QtWidgets.QWidget):
             xmax = t_xmax - t_xmin + (2 * overscan)
             ymax = t_ymax - t_ymin
 
+            # Замечание 3: Оптимизация — слияние через unary_union ДО цикла
             moved_geometries = []
             if invert_mode:
                 bounding_box = Polygon([(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)])
@@ -470,6 +489,7 @@ class LaserConverterApp(QtWidgets.QWidget):
             gcode.append(f"G21 ; Миллиметры\nG90 ; Абсолютные координаты\n{selected_mode_txt} S0 ; Инициализация лазера")
             gcode.append(f"G0 X{0.0000:.4f} Y{(ymin + (step / 2.0)):.4f} F{feedrate} ; Старт")
 
+            # Замечание 2: Безопасный расчет количества строк растра
             lines_count = int(math.ceil((ymax - ymin) / step))
             if lines_count <= 0: lines_count = 1
 
@@ -478,9 +498,11 @@ class LaserConverterApp(QtWidgets.QWidget):
             red_overscan_path = QtGui.QPainterPath()
 
             for line_idx in range(lines_count):
+                # Замечание 2: Позиция строго по индексу без накопления float ошибок
                 current_y = ymin + (line_idx * step) + (step / 2.0)
                 if current_y > ymax: current_y = ymax
 
+                # Защита от фризов интерфейса при мелком шаге (каждые 200 строк)
                 if line_idx % 200 == 0:
                     self.status_label.setText(f"Расчет: строка {line_idx} из {lines_count}...")
                     QtWidgets.QApplication.processEvents()
@@ -502,6 +524,7 @@ class LaserConverterApp(QtWidgets.QWidget):
                                 start_x = float(g.coords[0][0])
                                 end_x = float(g.coords[-1][0])
                                 segments_coords.append((start_x, end_x))
+                            # Замечание 5: Обработка касаний на углах (Point)
                             elif g.geom_type == 'Point':
                                 pt_x = float(g.x)
                                 segments_coords.append((pt_x - 0.005, pt_x + 0.005))
@@ -569,10 +592,12 @@ class LaserConverterApp(QtWidgets.QWidget):
             self.view.setBackgroundBrush(QtGui.QColor("#f0f0f0"))
 
             red_item = QtWidgets.QGraphicsPathItem(red_overscan_path)
+            red_item.setCacheMode(QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache)
             red_item.setPen(QtGui.QPen(QtGui.QColor("#ff0000"), 0.03, QtCore.Qt.PenStyle.SolidLine))
             self.view.scene.addItem(red_item)
 
             blue_item = QtWidgets.QGraphicsPathItem(blue_laser_path)
+            blue_item.setCacheMode(QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache)
             blue_item.setPen(QtGui.QPen(QtGui.QColor("#0000ff"), step, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
             self.view.scene.addItem(blue_item)
 
@@ -595,7 +620,7 @@ class LaserConverterApp(QtWidgets.QWidget):
         output_path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Сохранить лазерный G-Code", default_output_name, "G-Code Files (*.gcode *.nc);;All Files (*)")
         if output_path:
             try:
-                with open(output_path, "w", encoding='utf-8') as f:
+                with open(output_path, "w", encoding='utf-8') as f: 
                     f.write(self.generated_gcode)
                 self.status_label.setText(f"Файл сохранен: {os.path.basename(output_path)}")
             except Exception as e:
