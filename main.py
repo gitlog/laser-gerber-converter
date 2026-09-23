@@ -170,6 +170,7 @@ class LaserConverterApp(QtWidgets.QWidget):
         self.spin_overscan.setDecimals(1)
         self.spin_overscan.setRange(0.0, 50.0)
         self.spin_overscan.setValue(2.0)
+        self.spin_overscan.setSingleStep(0.5)
         self.param_grid.addWidget(self.spin_overscan, 4, 1)
         
         self.param_grid.addWidget(QtWidgets.QLabel("Точный поворот стола (град):"), 5, 0)
@@ -202,6 +203,7 @@ class LaserConverterApp(QtWidgets.QWidget):
         
         self.spin_rotate.valueChanged.connect(self.update_interactive_preview)
         self.spin_overscan.valueChanged.connect(self.update_interactive_preview)
+        self.cb_snake.stateChanged.connect(self.update_interactive_preview)
         self.cb_invert.stateChanged.connect(self.update_interactive_preview)
         self.cb_flip_x.stateChanged.connect(self.update_interactive_preview)
         self.cb_flip_y.stateChanged.connect(self.update_interactive_preview)
