@@ -1,44 +1,94 @@
 import sys
 import os
 import math
-
+import re
+import traceback
 from gerbyx import logger
 from gerbyx.tokenizer import tokenize_gerber
 from gerbyx.parser import GerberParser
 from gerbyx.processor import GerberProcessor
 
 from shapely.geometry import LineString, Polygon, MultiPolygon, Point
-from shapely.affinity import rotate, scale, translate
+from shapely.affinity import rotate, scale, translate, affine_transform
 from shapely.ops import unary_union
 
 from PyQt6 import QtWidgets, QtCore, QtGui
+import numpy as np
+
+class CrosshairOverlay(QtWidgets.QWidget):
+    """Кастомное 'стекло' поверх экрана. Рисует прицел во весь экран с 3 кольцами-мишенями."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.active = False
+
+    def paintEvent(self, event):
+        if not self.active:
+            return
+
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+
+        # Насыщенный полупрозрачный красный цвет для прицела
+        pen = QtGui.QPen(QtGui.QColor(255, 23, 68, 90), 2.0)
+        painter.setPen(pen)
+
+        # Находим точный центр видимого оверлея
+        cx = self.width() // 2
+        cy = self.height() // 2
+
+        # Линии креста от края до края экрана
+        painter.drawLine(0, cy, self.width(), cy)
+        painter.drawLine(cx, 0, cx, self.height())
+        painter.drawEllipse(QtCore.QPoint(cx, cy), 8, 8)   # Малое кольцо (радиус 8px)
+        painter.drawEllipse(QtCore.QPoint(cx, cy), 24, 24) # Среднее кольцо (радиус 24px)
+        painter.drawEllipse(QtCore.QPoint(cx, cy), 48, 48) # Большое кольцо (радиус 48px)
+        painter.end()
 
 class LaserGraphicsView(QtWidgets.QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
-        
-        # БЕЗ OPENGL: Используем только стандартный движок, но с агрессивным кэшированием
-        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False) # Выключаем сглаживание для скорости
+
+        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
         self.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
-        
-        # Обновляем только те пиксели, которые реально изменились (экономит CPU)
         self.setViewportUpdateMode(QtWidgets.QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
-        
-        # ИСПРАВЛЕНО ДЛЯ PyQt6: Включаем кэширование заднего фона (координатной сетки)
         self.setCacheMode(QtWidgets.QGraphicsView.CacheModeFlag.CacheBackground)
-        
-        self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setResizeAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        
+
+        # Жесткое центрирование зума по центру экрана
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setResizeAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorViewCenter)
+
         self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setDragMode(QtWidgets.QGraphicsView.DragMode.ScrollHandDrag)
-        
+
         self.scene = QtWidgets.QGraphicsScene(self)
         self.setScene(self.scene)
-        
+
+        # Создаем оверлей прицела и жестко сажаем его поверх вьюпорта
+        self.overlay = CrosshairOverlay(self)
+
+    def resizeEvent(self, event):
+        """При изменении размеров окна растягиваем прозрачное стекло прицела вслед за ним"""
+        super().resizeEvent(event)
+        self.overlay.setGeometry(self.viewport().geometry())
+
+    @property
+    def calibration_mode(self):
+        return self.overlay.active
+
+    @calibration_mode.setter
+    def calibration_mode(self, value):
+        self.overlay.active = value
+        self.overlay.update() # Заставляем оверлей мгновенно перерисоваться
+
+    def get_center_board_coordinates(self):
+        """Вычисляет, какая точная координата Shapely-сцены сейчас находится строго по центру экрана"""
+        view_center = self.viewport().rect().center()
+        scene_pos = self.mapToScene(view_center)
+        return scene_pos.x(), scene_pos.y()
+
     def wheelEvent(self, event: QtGui.QWheelEvent):
-        """Плавный Zoom колесиком мыши относительно курсора"""
         zoom_factor = 1.25
         if event.angleDelta().y() > 0:
             self.scale(zoom_factor, zoom_factor)
@@ -48,21 +98,19 @@ class LaserGraphicsView(QtWidgets.QGraphicsView):
     def drawBackground(self, painter: QtGui.QPainter, rect: QtCore.QRectF):
         """Динамическая миллиметровая сетка (Оптимизированная под CPU)"""
         painter.fillRect(rect, QtGui.QColor("#e8e8e8"))
-        
+
         scene_rect = self.sceneRect()
         left = int(math.floor(scene_rect.left()))
         right = int(math.ceil(scene_rect.right()))
         top = int(math.floor(scene_rect.top()))
         bottom = int(math.ceil(scene_rect.bottom()))
-        
-        # Толщина 0 включает режим косметического пера (Fast Line Drawing)
+
         pen_grid_1mm = QtGui.QPen(QtGui.QColor("#dcdcdc"), 0, QtCore.Qt.PenStyle.SolidLine)
         pen_grid_10mm = QtGui.QPen(QtGui.QColor("#b8b8b8"), 0, QtCore.Qt.PenStyle.SolidLine)
         pen_axes = QtGui.QPen(QtGui.QColor("#808080"), 0, QtCore.Qt.PenStyle.SolidLine)
-        
-        # Показываем 1мм сетку только при близком зуме
+
         show_1mm = (right - left) < 150
-        
+
         for x in range(left - 10, right + 10):
             if x % 10 == 0:
                 painter.setPen(pen_grid_10mm)
@@ -70,7 +118,7 @@ class LaserGraphicsView(QtWidgets.QGraphicsView):
             elif show_1mm and x % 1 == 0:
                 painter.setPen(pen_grid_1mm)
                 painter.drawLine(x, top - 10, x, bottom + 10)
-                
+
         for y in range(top - 10, bottom + 10):
             if y % 10 == 0:
                 painter.setPen(pen_grid_10mm)
@@ -82,39 +130,45 @@ class LaserGraphicsView(QtWidgets.QGraphicsView):
         painter.setPen(pen_axes)
         painter.drawLine(0, top - 10, 0, bottom + 10)
         painter.drawLine(left - 10, 0, right + 10, 0)
-        
+
         font = painter.font()
         font.setPointSizeF(2.0)
         painter.setFont(font)
         painter.setPen(QtGui.QColor("#555555"))
-        
+
         for x in range((left // 10) * 10, right + 10, 10):
             if x != 0:
                 painter.drawText(QtCore.QRectF(x - 5, 0.5, 10, 3), QtCore.Qt.AlignmentFlag.AlignCenter, str(x))
-                
+
         for y in range((top // 10) * 10, bottom + 10, 10):
             if y != 0:
                 label_y = -y
                 painter.drawText(QtCore.QRectF(-12.0, y - 1.5, 11.0, 3.0), QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, str(label_y))
-
-
 class LaserConverterApp(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         ini_path = os.path.expanduser("~/.LaserConverterApp.ini")
         self.settings = QtCore.QSettings(ini_path, QtCore.QSettings.Format.IniFormat)
-        
+
         self.current_gerber_geometry = None
         self.generated_gcode = None
         self.gerber_is_inches = False
-        
+
+        # Переменные для ручного авиационного базирования (массивы на 4 точки)
+        self.manual_file_pts = [None, None, None, None]  # Координаты из файла [(x,y), ...]
+        self.manual_mach_pts = [None, None, None, None]  # Координаты со станка [(X,Y), ...]
+        self.manual_markers = [None, None, None, None]   # Маркеры-отметки на сцене
+
+        self.use_calibration = False
+        self.matrix_coeffs = None
+
         self.init_ui()
         self.load_saved_settings()
 
     def init_ui(self):
         self.setWindowTitle("LaserGRBL Raster Converter & Native Visualizer")
-        self.setMinimumWidth(1100)
-        self.setMinimumHeight(670)
+        self.setMinimumWidth(1150)
+        self.setMinimumHeight(760)
 
         self.layout_horizontal = QtWidgets.QHBoxLayout()
         self.setLayout(self.layout_horizontal)
@@ -122,7 +176,7 @@ class LaserConverterApp(QtWidgets.QWidget):
         self.left_panel = QtWidgets.QWidget()
         self.left_layout = QtWidgets.QVBoxLayout()
         self.left_panel.setLayout(self.left_layout)
-        self.left_panel.setFixedWidth(420)
+        self.left_panel.setFixedWidth(430)
         self.layout_horizontal.addWidget(self.left_panel)
 
         self.file_group = QtWidgets.QGroupBox("Исходный файл Gerber")
@@ -172,7 +226,6 @@ class LaserConverterApp(QtWidgets.QWidget):
         self.spin_overscan.setValue(2.0)
         self.spin_overscan.setSingleStep(0.5)
         self.param_grid.addWidget(self.spin_overscan, 4, 1)
-        
         self.param_grid.addWidget(QtWidgets.QLabel("Точный поворот стола (град):"), 5, 0)
         self.spin_rotate = QtWidgets.QDoubleSpinBox()
         self.spin_rotate.setDecimals(3)
@@ -196,11 +249,49 @@ class LaserConverterApp(QtWidgets.QWidget):
         self.modes_layout.addWidget(self.cb_flip_y, 1, 1)
         self.left_layout.addWidget(self.modes_group)
 
+        self.cb_enable_calib = QtWidgets.QCheckBox("Включить ручную разметку платы")
+        self.cb_enable_calib.setStyleSheet("font-weight: bold; color: #0288d1; margin-top: 5px;")
+        self.cb_enable_calib.stateChanged.connect(self.toggle_manual_calibration)
+        self.left_layout.addWidget(self.cb_enable_calib) # ЖЕСТКО ДОБАВЛЯЕМ НА ЛЕВУЮ ПАНЕЛЬ
+
+        self.calib_group = QtWidgets.QGroupBox("Базирование по центральному прицелу")
+        self.calib_layout = QtWidgets.QVBoxLayout()
+        self.calib_group.setLayout(self.calib_layout)
+
+        self.cb_use_pt4 = QtWidgets.QCheckBox("Использовать 4-ю точку для коррекции деформаций")
+        self.cb_use_pt4.stateChanged.connect(self.toggle_pt4_active)
+        self.calib_layout.addWidget(self.cb_use_pt4)
+
+        self.cb_show_markers = QtWidgets.QCheckBox("Показывать зафиксированные точки на плате")
+        self.cb_show_markers.setChecked(True)
+        self.cb_show_markers.stateChanged.connect(self.toggle_markers_visibility)
+        self.calib_layout.addWidget(self.cb_show_markers)
+
+        # Кнопки мгновенного действия
+        self.btn_pt1 = QtWidgets.QPushButton("Зафиксировать Точку 1")
+        self.btn_pt2 = QtWidgets.QPushButton("Зафиксировать Точку 2")
+        self.btn_pt3 = QtWidgets.QPushButton("Зафиксировать Точку 3")
+        self.btn_pt4 = QtWidgets.QPushButton("Зафиксировать Точку 4")
+        self.btn_pt4.setDisabled(True)
+
+        self.btn_pt1.clicked.connect(lambda: self.capture_point_in_crosshair(0))
+        self.btn_pt2.clicked.connect(lambda: self.capture_point_in_crosshair(1))
+        self.btn_pt3.clicked.connect(lambda: self.capture_point_in_crosshair(2))
+        self.btn_pt4.clicked.connect(lambda: self.capture_point_in_crosshair(3))
+
+        self.calib_layout.addWidget(self.btn_pt1)
+        self.calib_layout.addWidget(self.btn_pt2)
+        self.calib_layout.addWidget(self.btn_pt3)
+        self.calib_layout.addWidget(self.btn_pt4)
+
+        self.left_layout.addWidget(self.calib_group)
+        self.calib_group.setVisible(False) # Скрыта по умолчанию, пока не нажат чекбокс выше
+
         self.combo_laser_mode.currentIndexChanged.connect(self.save_current_settings)
         self.spin_power.valueChanged.connect(self.save_current_settings)
         self.spin_feed.valueChanged.connect(self.save_current_settings)
         self.spin_step.valueChanged.connect(self.save_current_settings)
-        
+
         self.spin_rotate.valueChanged.connect(self.update_interactive_preview)
         self.spin_overscan.valueChanged.connect(self.update_interactive_preview)
         self.cb_snake.stateChanged.connect(self.update_interactive_preview)
@@ -227,6 +318,7 @@ class LaserConverterApp(QtWidgets.QWidget):
         self.plot_group = QtWidgets.QGroupBox("Экран интерактивной визуализации векторов")
         self.plot_layout = QtWidgets.QVBoxLayout()
         self.plot_group.setLayout(self.plot_layout)
+
         self.view = LaserGraphicsView()
         self.plot_layout.addWidget(self.view)
         self.layout_horizontal.addWidget(self.plot_group)
@@ -284,7 +376,6 @@ class LaserConverterApp(QtWidgets.QWidget):
     def closeEvent(self, event):
         self.save_current_settings()
         event.accept()
-
     def browse_file(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Открыть Gerber файл", "", "Gerber Files (*.gbr *.pho);;All Files (*)")
         if file_path:
@@ -295,13 +386,18 @@ class LaserConverterApp(QtWidgets.QWidget):
             QtWidgets.QApplication.processEvents()
             self.load_gerber_geometry(file_path)
 
+    def toggle_markers_visibility(self, state):
+        """Динамически скрывает или показывает цветные точки-отметки на сцене"""
+        is_visible = (state == 2)
+        for marker in self.manual_markers:
+            if marker:
+                marker.setVisible(is_visible)
+
     def load_gerber_geometry(self, gerber_path):
         try:
-            # Замечание 4: Явно указываем UTF-8 кодировку
             with open(gerber_path, 'r', encoding='utf-8', errors='ignore') as f:
                 gerber_source = f.read()
             
-            # Замечание 1: Проверяем дюймы (%MOIN%)
             self.gerber_is_inches = "%MOIN%" in gerber_source
 
             processor = GerberProcessor()
@@ -311,7 +407,6 @@ class LaserConverterApp(QtWidgets.QWidget):
             
             parsed_geoms = [g for g in processor.geometries if not g.is_empty]
             
-            # Замечание 1: Масштабируем дюймы в мм
             if self.gerber_is_inches:
                 self.current_gerber_geometry = [scale(g, xfact=25.4, yfact=25.4, origin=(0, 0)) for g in parsed_geoms]
             else:
@@ -327,11 +422,223 @@ class LaserConverterApp(QtWidgets.QWidget):
             self.status_label.setText(f"Ошибка загрузки Gerber: {str(e)}")
             self.status_label.setStyleSheet("color: red;")
 
-    def get_transformed_elements(self):
-        # Замечание 6: Защита от пустой геометрии
-        if not self.current_gerber_geometry: 
-            return []
+    def toggle_manual_calibration(self, state):
+        """Включение/выключение режима центрального прицела и панели кнопок"""
+        # Проверяем, стоит ли галочка (2 означает Qt.CheckState.Checked)
+        is_active = (state == 2)
 
+        # Железно показываем или скрываем блок с кнопками Точка 1-4
+        if hasattr(self, 'calib_group'):
+            self.calib_group.setVisible(is_active)
+
+        # Включаем или выключаем отображение прозрачного прицела на экране
+        if hasattr(self, 'view'):
+            self.view.calibration_mode = is_active
+            self.view.viewport().update() # Мгновенно перерисовываем стекло
+
+        # Если пользователь снял галочку — сбрасываем старую калибровку
+        if not is_active:
+            self.use_calibration = False
+            for marker in self.manual_markers:
+                if marker:
+                    try: self.view.scene.removeItem(marker)
+                    except: pass
+            self.manual_file_pts = [None, None, None, None]
+            self.manual_mach_pts = [None, None, None, None]
+            self.manual_markers = [None, None, None, None]
+
+            if hasattr(self, 'btn_pt1'): self.btn_pt1.setText("Зафиксировать Точку 1")
+            if hasattr(self, 'btn_pt2'): self.btn_pt2.setText("Зафиксировать Точку 2")
+            if hasattr(self, 'btn_pt3'): self.btn_pt3.setText("Зафиксировать Точку 3")
+            if hasattr(self, 'btn_pt4'): self.btn_pt4.setText("Зафиксировать Точку 4")
+
+            for btn in [self.btn_pt1, self.btn_pt2, self.btn_pt3, self.btn_pt4]:
+                if hasattr(btn, 'setStyleSheet'): btn.setStyleSheet("")
+
+            if self.current_gerber_geometry:
+                self.update_interactive_preview()
+
+    def toggle_pt4_active(self, state):
+        """Включение/выключение использования опциональной 4-й точки"""
+        is_active = (state == 2)
+        self.btn_pt4.setEnabled(is_active)
+
+        if not is_active:
+            if self.manual_markers[3]:
+                try: self.view.scene.removeItem(self.manual_markers[3])
+                except: pass
+            self.manual_file_pts[3] = None
+            self.manual_mach_pts[3] = None
+            self.manual_markers[3] = None
+            self.btn_pt4.setText("Зафиксировать Точку 4")
+            self.btn_pt4.setStyleSheet("")
+
+            # Пересчитываем матрицу по 3 точкам, если они уже готовы
+            if all(pt is not None for pt in self.manual_file_pts[:3]) and all(pt is not None for pt in self.manual_mach_pts[:3]):
+                self.calculate_manual_affine_matrix()
+    def capture_point_in_crosshair(self, point_idx):
+        """Мгновенно фиксирует координаты файла, которые находятся строго под центральным прицелом"""
+        if not self.current_gerber_geometry:
+            QtWidgets.QMessageBox.warning(self, "Внимание", "Сначала загрузите Gerber файл!")
+            return
+
+        buttons = [self.btn_pt1, self.btn_pt2, self.btn_pt3, self.btn_pt4]
+
+        # 1. Запрашиваем у движка LaserGraphicsView текущие координаты центра экрана
+        scene_x, scene_y = self.view.get_center_board_coordinates()
+
+        # 2. Пересчитываем метрические координаты сцены обратно в исходные координаты Gerber-файла
+        transformed_elements = self.get_transformed_elements_raw()
+        if not transformed_elements: return
+        t_bounds = [g.bounds for g in transformed_elements]
+        t_xmin = min([b[0] for b in t_bounds])
+
+        # Идеально точный расчет координат файла (ровно под прицелом)
+        exact_file_x = scene_x + t_xmin
+        exact_file_y = -scene_y
+
+        # Сохраняем точную координату файла
+        self.manual_file_pts[point_idx] = (exact_file_x, exact_file_y)
+
+        # Удаляем старый маркер-отметку для этой точки, если он существовал
+        if self.manual_markers[point_idx]:
+            try: self.view.scene.removeItem(self.manual_markers[point_idx])
+            except: pass
+
+        # Цвета фиксированных точек-отметок: 1 - Красный, 2 - Синий, 3 - Зеленый, 4 - Фиолетовый
+        colors = ["#ff1744", "#2979ff", "#00e676", "#e040fb"]
+
+        # Ставим на чертеж маленькую точку-отметку строго по координатам scene_x, scene_y (прямо под прицел)
+        marker = QtWidgets.QGraphicsEllipseItem(scene_x - 0.4, scene_y - 0.4, 0.8, 0.8)
+        marker.setBrush(QtGui.QBrush(QtGui.QColor(colors[point_idx])))
+        marker.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 0.15)) # Четкий белый контур
+
+        if hasattr(self, 'cb_show_markers'):
+            marker.setVisible(self.cb_show_markers.isChecked())
+
+        self.view.scene.addItem(marker)
+        self.manual_markers[point_idx] = marker
+
+        self.status_label.setText(f"Статус: Точка {point_idx + 1} зафиксирована в прицеле.")
+        self.status_label.setStyleSheet("color: #0288d1;")
+
+        # 3. Открываем кастомное цифровое окно ввода со стрелочками
+        try:
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle(f"Координаты станка для Точки {point_idx + 1}")
+            dialog.setMinimumWidth(340)
+
+            dialog_layout = QtWidgets.QVBoxLayout(dialog)
+
+            info_text = (
+                f"Вы навели прицел на репер платы:\n"
+                f"X: {exact_file_x:.3f}, Y: {exact_file_y:.3f}\n\n"
+                f"Задайте точные координаты станка ЧПУ:"
+            )
+            dialog_layout.addWidget(QtWidgets.QLabel(info_text))
+
+            grid = QtWidgets.QGridLayout()
+            dialog_layout.addLayout(grid)
+
+            grid.addWidget(QtWidgets.QLabel("Координата X станка (мм):"), 0, 0)
+            spin_x = QtWidgets.QDoubleSpinBox()
+            spin_x.setDecimals(3)
+            spin_x.setRange(-9999.000, 9999.000)
+            spin_x.setSingleStep(0.1)
+            grid.addWidget(spin_x, 0, 1)
+
+            grid.addWidget(QtWidgets.QLabel("Координата Y станка (мм):"), 1, 0)
+            spin_y = QtWidgets.QDoubleSpinBox()
+            spin_y.setDecimals(3)
+            spin_y.setRange(-9999.000, 9999.000)
+            spin_y.setSingleStep(0.1)
+            grid.addWidget(spin_y, 1, 1)
+
+            # ЖЕЛЕЗНАЯ ПОДСТАНОВКА: Всегда подставляем текущие координаты из Gerber-файла
+            spin_x.setValue(exact_file_x)
+            spin_y.setValue(exact_file_y)
+
+            button_box = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+                dialog
+            )
+            button_box.accepted.connect(dialog.accept)
+            button_box.rejected.connect(dialog.reject)
+            dialog_layout.addWidget(button_box)
+
+            if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                mach_x = spin_x.value()
+                mach_y = spin_y.value()
+
+                self.manual_mach_pts[point_idx] = (mach_x, mach_y)
+                buttons[point_idx].setText(f"Т{point_idx + 1}: Файл({exact_file_x:.1f}, {exact_file_y:.1f}) -> Ст({mach_x:.1f}, {mach_y:.1f})")
+                buttons[point_idx].setStyleSheet("background-color: #c8e6c9; font-weight: bold;")
+
+                p1_3_ready = all(pt is not None for pt in self.manual_file_pts[:3]) and all(pt is not None for pt in self.manual_mach_pts[:3])
+                p4_enabled = self.cb_use_pt4.isChecked()
+                p4_ready = self.manual_file_pts[3] is not None and self.manual_mach_pts[3] is not None if p4_enabled else True
+
+                if p1_3_ready and p4_ready:
+                    self.calculate_manual_affine_matrix()
+            else:
+                if self.manual_markers[point_idx]:
+                    try: self.view.scene.removeItem(self.manual_markers[point_idx])
+                    except: pass
+                self.manual_file_pts[point_idx] = None
+                self.manual_markers[point_idx] = None
+                buttons[point_idx].setText(f"Зафиксировать Точку {point_idx + 1}")
+                buttons[point_idx].setStyleSheet("")
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", f"Сбой работы окна ввода: {str(e)}. Сброшено.")
+            if self.manual_markers[point_idx]:
+                try: self.view.scene.removeItem(self.manual_markers[point_idx])
+                except: pass
+            self.manual_file_pts[point_idx] = None
+            self.manual_markers[point_idx] = None
+            buttons[point_idx].setText(f"Зафиксировать Точку {point_idx + 1}")
+            buttons[point_idx].setStyleSheet("")
+
+    def calculate_manual_affine_matrix(self):
+        """Расчет аффинной матрицы, автоматически адаптирующийся под 3 или 4 точки"""
+        try:
+            valid_indices = [i for i in range(4) if self.manual_file_pts[i] is not None and self.manual_mach_pts[i] is not None]
+            if len(valid_indices) < 3: return
+
+            x_f = [self.manual_file_pts[i][0] for i in valid_indices]
+            y_f = [self.manual_file_pts[i][1] for i in valid_indices]
+            X_m = [self.manual_mach_pts[i][0] for i in valid_indices]
+            Y_m = [self.manual_mach_pts[i][1] for i in valid_indices]
+
+            A = np.zeros((len(valid_indices), 3))
+            for idx in range(len(valid_indices)):
+                A[idx] = [x_f[idx], y_f[idx], 1]
+
+            # Находим коэффициенты методом наименьших квадратов (LSTSQ)
+            a, b, x_off = np.linalg.lstsq(A, X_m, rcond=None)[0]
+            d, e, y_off = np.linalg.lstsq(A, Y_m, rcond=None)[0]
+
+            self.matrix_coeffs = (a, b, d, e, x_off, y_off)
+            self.use_calibration = True
+
+            pts_count = len(valid_indices)
+            self.status_label.setText(f"Статус: Базирование выполнено успешно по {pts_count} точкам!")
+            self.status_label.setStyleSheet("color: green; font-weight: bold;")
+
+            for marker in self.manual_markers:
+                if marker:
+                    try: self.view.scene.removeItem(marker)
+                    except: pass
+            self.manual_markers = [None, None, None, None]
+
+            self.update_interactive_preview()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка расчета", f"Не удалось рассчитать коэффициенты трансформации: {str(e)}")
+            self.use_calibration = False
+
+    def get_transformed_elements_raw(self):
+        """Вспомогательный метод получения базовой геометрии для разметки без калибровки"""
+        if not self.current_gerber_geometry: return []
         rotate_angle = self.spin_rotate.value()
         flip_x = self.cb_flip_x.isChecked()
         flip_y = self.cb_flip_y.isChecked()
@@ -353,11 +660,27 @@ class LaserConverterApp(QtWidgets.QWidget):
                 geom = rotate(geom, rotate_angle, origin=geom_center)
             transformed.append(geom)
         return transformed
+    def get_transformed_elements(self):
+        """Основной метод: трансформирует геометрию под ручные ползунки или точную матрицу пятачков"""
+        if not self.current_gerber_geometry: 
+            return []
+
+        # Если включен режим точного базирования и матрица успешно посчитана
+        has_calib_btn = hasattr(self, 'cb_enable_calib') and self.cb_enable_calib.isChecked()
+        if has_calib_btn and hasattr(self, 'use_calibration') and self.use_calibration:
+
+            transformed = []
+            for geom in self.current_gerber_geometry:
+                # Применяем матрицу трансформации: сдвиг, поворот и перекос всей платы под координаты станка
+                t_geom = affine_transform(geom, self.matrix_coeffs)
+                transformed.append(t_geom)
+            return transformed
+
+        # В противном случае работает стандартный ручной режим
+        return self.get_transformed_elements_raw()
 
     def update_interactive_preview(self):
-        if not self.current_gerber_geometry: 
-            return
-
+        if not self.current_gerber_geometry: return
         self.save_current_settings()
         overscan = self.spin_overscan.value()
         invert_mode = self.cb_invert.isChecked()
@@ -409,13 +732,10 @@ class LaserConverterApp(QtWidgets.QWidget):
 
             w = t_xmax - t_xmin + (2 * overscan)
             h = t_ymax - t_ymin
-            
             if w <= 0 or h <= 0: return
 
             self.view.scene.setSceneRect(-5, -h - 5, w + 10, h + 10)
-
             path_item = QtWidgets.QGraphicsPathItem(qt_path)
-            # Включаем DeviceCoordinateCache процессора для плавной отрисовки зума без лагов
             path_item.setCacheMode(QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache)
 
             if invert_mode:
@@ -423,7 +743,6 @@ class LaserConverterApp(QtWidgets.QWidget):
                 bg_rect.setBrush(QtGui.QBrush(QtGui.QColor("#1565c0")))
                 bg_rect.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen))
                 self.view.scene.addItem(bg_rect)
-
                 path_item.setBrush(QtGui.QBrush(QtGui.QColor("#e8e8e8")))
                 path_item.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen))
                 self.view.scene.addItem(path_item)
@@ -437,12 +756,51 @@ class LaserConverterApp(QtWidgets.QWidget):
             home_marker.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 0.2))
             self.view.scene.addItem(home_marker)
 
+            if hasattr(self, 'cb_enable_calib') and self.cb_enable_calib.isChecked():
+                colors = ["#ff1744", "#2979ff", "#00e676", "#e040fb"]
+                for idx, pt in enumerate(self.manual_file_pts):
+                    if pt is not None:
+                        file_x, file_y = pt
+
+                        # Проверяем, включен ли уже калиброванный режим станка
+                        if hasattr(self, 'use_calibration') and self.use_calibration and self.matrix_coeffs:
+                            a, b, d, e, x_off, y_off = self.matrix_coeffs
+                            ax, bx, dx, ey = float(a), float(b), float(d), float(e)
+                            xo, yo = float(x_off), float(y_off)
+
+                            # Классическая формула аффинного преобразования вектора
+                            sc_x = ax * file_x + bx * file_y + xo
+                            sc_y = dx * file_x + ey * file_y + yo
+
+                            # Приводим к экранной системе координат GraphicsView
+                            sc_x = sc_x - t_xmin
+                            sc_y = -sc_y
+                        else:
+                            # Режим без матрицы (до ввода 3-й точки)
+                            sc_x = file_x - t_xmin + overscan
+                            sc_y = -file_y
+
+                        # Создаем и наносим маркер на его честное математическое место
+                        m_item = QtWidgets.QGraphicsEllipseItem(sc_x - 0.3, sc_y - 0.3, 0.6, 0.6)
+                        m_item.setBrush(QtGui.QBrush(QtGui.QColor(colors[idx])))
+                        m_item.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 0.1))
+
+                        if hasattr(self, 'cb_show_markers'):
+                            m_item.setVisible(self.cb_show_markers.isChecked())
+
+                        self.view.scene.addItem(m_item)
+                        self.manual_markers[idx] = m_item
+
             self.status_label.setText(f"Статус: Геометрия готова. Размер: {w:.2f} x {h:.2f} мм")
             self.status_label.setStyleSheet("color: #2e7d32;")
+
         except Exception as e:
+            # ДОБАВЛЕНО: Печатает полную структуру и точное место ошибки в терминал/консоль
+            print("\n" + "="*40 + " КРИТИЧЕСКАЯ ОШИБКА Ошибка визуализации " + "="*40)
+            traceback.print_exc()
+            print("="*115 + "\n")
             self.status_label.setText(f"Ошибка визуализации: {str(e)}")
             self.status_label.setStyleSheet("color: red;")
-
     def process_conversion(self):
         if not self.current_gerber_geometry: return
         self.save_current_settings()
@@ -454,7 +812,7 @@ class LaserConverterApp(QtWidgets.QWidget):
         feedrate = self.spin_feed.value()
         step = self.spin_step.value()
         overscan = self.spin_overscan.value()
-        
+
         snake_mode = self.cb_snake.isChecked()
         invert_mode = self.cb_invert.isChecked()
         selected_mode_txt = "M4" if self.combo_laser_mode.currentIndex() == 0 else "M3"
@@ -464,34 +822,36 @@ class LaserConverterApp(QtWidgets.QWidget):
             if not transformed_elements: return
             
             t_bounds = [g.bounds for g in transformed_elements]
-            t_xmin = min([b[0] for b in t_bounds])
-            t_ymin = min([b[1] for b in t_bounds])
-            t_xmax = max([b[2] for b in t_bounds])
-            t_ymax = max([b[3] for b in t_bounds])
 
+            # --- СТРОГОЕ ИЗВЛЕЧЕНИЕ ЧИСЕЛ ИЗ КОРТЕЖЕЙ BOUNDS ---
+            # Извлекаем чистые float значения из всех shapely-границ
+            raw_xmin = float(min([b[0] for b in t_bounds]))
+            raw_ymin = float(min([b[1] for b in t_bounds]))
+            raw_xmax = float(max([b[2] for b in t_bounds]))
+            raw_ymax = float(max([b[3] for b in t_bounds]))
+
+            # Локальная система координат для лазера (от нуля станка)
             xmin, ymin = 0.0, 0.0
-            xmax = t_xmax - t_xmin + (2 * overscan)
-            ymax = t_ymax - t_ymin
+            xmax = float(raw_xmax - raw_xmin + (2 * overscan))
+            ymax = float(raw_ymax - raw_ymin)
 
-            # Замечание 3: Оптимизация — слияние через unary_union ДО цикла
             moved_geometries = []
             if invert_mode:
                 bounding_box = Polygon([(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)])
                 final_mask = bounding_box
                 for geom in transformed_elements:
-                    shifted_geom = translate(geom, xoff=(-t_xmin + overscan), yoff=-t_ymin)
+                    shifted_geom = translate(geom, xoff=(-raw_xmin + overscan), yoff=-raw_ymin)
                     final_mask = final_mask.difference(shifted_geom)
                 moved_geometries.append(final_mask)
             else:
-                merged_pads = unary_union([translate(geom, xoff=(-t_xmin + overscan), yoff=-t_ymin) for geom in transformed_elements])
+                merged_pads = unary_union([translate(geom, xoff=(-raw_xmin + overscan), yoff=-raw_ymin) for geom in transformed_elements])
                 moved_geometries.append(merged_pads)
 
             gcode = []
-            gcode.append("; Gerber -> LaserGRBL GCode (Native Fast Engine)")
-            gcode.append(f"G21 ; Миллиметры\nG90 ; Абсолютные координаты\n{selected_mode_txt} S0 ; Инициализация лазера\nG1 F{feedrate}")
-            gcode.append(f"G0 X{0.0000:.4f} Y{(ymin + (step / 2.0)):.4f} F{feedrate} ; Старт")
+            gcode.append("; Gerber -> LaserGRBL GCode (Native Fast Engine Matrix Optimized)")
+            gcode.append(f"G21 ; Миллиметры\nG90 ; Абсолютные координаты\n{selected_mode_txt} S0\nG1 F{feedrate}")
+            gcode.append(f"G0 X{0.0000:.4f} Y{(ymin + (step / 2.0)):.4f} F{feedrate}")
 
-            # Замечание 2: Безопасный расчет количества строк растра
             lines_count = int(math.ceil((ymax - ymin) / step))
             if lines_count <= 0: lines_count = 1
 
@@ -500,14 +860,15 @@ class LaserConverterApp(QtWidgets.QWidget):
             red_overscan_path = QtGui.QPainterPath()
 
             for line_idx in range(lines_count):
-                # Замечание 2: Позиция строго по индексу без накопления float ошибок
                 current_y = ymin + (line_idx * step) + (step / 2.0)
                 if current_y > ymax: current_y = ymax
 
-                # Защита от фризов интерфейса при мелком шаге (каждые 200 строк)
                 if line_idx % 200 == 0:
                     self.status_label.setText(f"Расчет: строка {line_idx} из {lines_count}...")
                     QtWidgets.QApplication.processEvents()
+
+                scan_line = LineString([(xmin - 1.0, current_y), (xmax + 1.0, current_y)])
+                segments_coords = []
 
                 scan_line = LineString([(xmin - 1.0, current_y), (xmax + 1.0, current_y)])
                 segments_coords = []
@@ -526,7 +887,6 @@ class LaserConverterApp(QtWidgets.QWidget):
                                 start_x = float(g.coords[0][0])
                                 end_x = float(g.coords[-1][0])
                                 segments_coords.append((start_x, end_x))
-                            # Замечание 5: Обработка касаний на углах (Point)
                             elif g.geom_type == 'Point':
                                 pt_x = float(g.x)
                                 segments_coords.append((pt_x - 0.005, pt_x + 0.005))
@@ -552,7 +912,7 @@ class LaserConverterApp(QtWidgets.QWidget):
                     blue_laser_path.lineTo(e_x, -current_y)
 
                 if direction_right or not snake_mode:
-                    segments_coords.sort(key=lambda val: val[0])
+                    segments_coords.sort(key=lambda val: val)
                     gcode.append(f"G0 X{line_start_x:.4f} Y{current_y:.4f}")
                     red_overscan_path.moveTo(line_start_x, -current_y)
                     
@@ -568,7 +928,7 @@ class LaserConverterApp(QtWidgets.QWidget):
                         gcode.append(f"G1 X{line_end_x:.4f} S0")
                         red_overscan_path.lineTo(line_end_x, -current_y)
                 else:
-                    segments_coords.sort(key=lambda val: val[0], reverse=True)
+                    segments_coords.sort(key=lambda val: val, reverse=True)
                     gcode.append(f"G0 X{line_end_x:.4f} Y{current_y:.4f}")
                     red_overscan_path.moveTo(line_end_x, -current_y)
                     
@@ -611,7 +971,13 @@ class LaserConverterApp(QtWidgets.QWidget):
             self.status_label.setText(f"Статус: Успешно! Траектория построена ({lines_count} строк).")
             self.status_label.setStyleSheet("color: green;")
         except Exception as e:
-            self.status_label.setText(f"Ошибка вычислений: {str(e)}")
+            # ДОБАВЛЕНО: Печатает полную структуру и точное место ошибки в терминал/консоль
+            print("\n" + "="*40 + " КРИТИЧЕСКАЯ ОШИБКА РАСЧЕТА G-КОДА " + "="*40)
+            traceback.print_exc()
+            print("="*115 + "\n")
+
+            # Выводим короткое уведомление на экран пользователю
+            self.status_label.setText(f"Ошибка вычислений: {str(e)} (Подробности в консоли)")
             self.status_label.setStyleSheet("color: red;")
             self.btn_save.setDisabled(True)
 
